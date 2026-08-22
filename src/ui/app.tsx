@@ -28,23 +28,32 @@ import { readIngestOperationIssueId, uploadIssueAttachmentFile } from "./issue-a
 // available at runtime.
 // ---------------------------------------------------------------------------
 
+const themeBackground = "var(--background, oklch(0.145 0 0))";
+const themeForeground = "var(--foreground, oklch(0.985 0 0))";
+const themeTint = (accent: string) => `color-mix(in oklab, ${themeBackground} 84%, ${accent} 16%)`;
+const themeTintForeground = (accent: string) => `color-mix(in oklab, ${themeForeground} 72%, ${accent} 28%)`;
+
 const tokens = {
   border: "var(--border, oklch(0.269 0 0))",
   card: "var(--card, oklch(0.205 0 0))",
-  bg: "var(--background, oklch(0.145 0 0))",
-  fg: "var(--foreground, oklch(0.985 0 0))",
+  bg: themeBackground,
+  fg: themeForeground,
   muted: "var(--muted-foreground, oklch(0.708 0 0))",
   accent: "var(--accent, oklch(0.269 0 0))",
   primary: "var(--primary, oklch(0.985 0 0))",
   primaryFg: "var(--primary-foreground, oklch(0.205 0 0))",
   destructive: "var(--destructive, oklch(0.637 0.237 25.331))",
-  pluginBg: "oklch(0.3 0.06 70)",
-  pluginFg: "oklch(0.92 0.08 80)",
+  pluginBg: themeTint("oklch(0.65 0.15 70)"),
+  pluginFg: themeTintForeground("oklch(0.65 0.15 70)"),
   pluginBorder: "oklch(0.55 0.15 70)",
-  hiddenOpBg: "oklch(0.27 0.04 280)",
-  hiddenOpFg: "oklch(0.85 0.08 280)",
+  hiddenOpBg: themeTint("oklch(0.62 0.14 280)"),
+  hiddenOpFg: themeTintForeground("oklch(0.62 0.14 280)"),
   hiddenOpBorder: "oklch(0.45 0.1 280)",
-  callout: { bg: "oklch(0.2 0.04 250)", fg: "oklch(0.85 0.08 250)", border: "oklch(0.4 0.1 250)" },
+  callout: {
+    bg: themeTint("oklch(0.62 0.14 250)"),
+    fg: themeTintForeground("oklch(0.62 0.14 250)"),
+    border: "oklch(0.4 0.1 250)",
+  },
   statusDone: "oklch(0.65 0.16 145)",
   statusRunning: "oklch(0.7 0.13 200)",
   statusBlocked: "oklch(0.6 0.21 25)",
@@ -57,15 +66,15 @@ type Tone = "todo" | "in_progress" | "in_review" | "done" | "blocked" | "running
 
 const toneStyles: Record<Tone, CSSProperties> = {
   default: { background: "var(--secondary, oklch(0.269 0 0))", color: tokens.fg, border: `1px solid ${tokens.border}` },
-  todo: { background: "oklch(0.27 0.06 250)", color: "oklch(0.85 0.1 250)" },
-  in_progress: { background: "oklch(0.27 0.06 280)", color: "oklch(0.85 0.1 280)" },
-  in_review: { background: "oklch(0.27 0.07 305)", color: "oklch(0.85 0.1 305)" },
-  done: { background: "oklch(0.27 0.06 145)", color: "oklch(0.85 0.1 145)" },
-  blocked: { background: "oklch(0.27 0.08 25)", color: "oklch(0.82 0.13 25)" },
-  running: { background: "oklch(0.27 0.06 200)", color: "oklch(0.83 0.11 200)" },
-  paused: { background: "oklch(0.27 0.07 70)", color: "oklch(0.85 0.1 70)" },
-  failed: { background: "oklch(0.27 0.08 25)", color: "oklch(0.82 0.13 25)" },
-  queued: { background: "oklch(0.27 0.06 250)", color: "oklch(0.85 0.1 250)" },
+  todo: { background: themeTint("oklch(0.62 0.14 250)"), color: themeTintForeground("oklch(0.62 0.14 250)") },
+  in_progress: { background: themeTint("oklch(0.62 0.14 280)"), color: themeTintForeground("oklch(0.62 0.14 280)") },
+  in_review: { background: themeTint("oklch(0.62 0.14 305)"), color: themeTintForeground("oklch(0.62 0.14 305)") },
+  done: { background: themeTint("oklch(0.62 0.14 145)"), color: themeTintForeground("oklch(0.62 0.14 145)") },
+  blocked: { background: themeTint("oklch(0.62 0.18 25)"), color: themeTintForeground("oklch(0.62 0.18 25)") },
+  running: { background: themeTint("oklch(0.62 0.14 200)"), color: themeTintForeground("oklch(0.62 0.14 200)") },
+  paused: { background: themeTint("oklch(0.65 0.15 70)"), color: themeTintForeground("oklch(0.65 0.15 70)") },
+  failed: { background: themeTint("oklch(0.62 0.18 25)"), color: themeTintForeground("oklch(0.62 0.18 25)") },
+  queued: { background: themeTint("oklch(0.62 0.14 250)"), color: themeTintForeground("oklch(0.62 0.14 250)") },
 };
 
 const fontStack = `ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
@@ -576,7 +585,7 @@ function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
     <input
       {...props}
       style={{
-        background: "oklch(0.2 0 0)",
+        background: tokens.bg,
         border: `1px solid ${tokens.border}`,
         borderRadius: 6,
         padding: "6px 10px",
@@ -597,7 +606,7 @@ function TextArea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
     <textarea
       {...props}
       style={{
-        background: "oklch(0.2 0 0)",
+        background: tokens.bg,
         border: `1px solid ${tokens.border}`,
         borderRadius: 6,
         padding: "6px 10px",
@@ -4187,7 +4196,7 @@ function SpacePicker({
           display: "flex",
           alignItems: "center",
           gap: 8,
-          background: "oklch(0.2 0 0)",
+          background: tokens.bg,
           border: `1px solid ${tokens.border}`,
           borderRadius: 6,
           padding: "8px 10px",
@@ -5229,7 +5238,7 @@ function FolderPathPicker({
     <div style={{
       border: `1px solid ${tokens.border}`,
       borderRadius: 8,
-      background: "oklch(0.18 0 0)",
+      background: tokens.bg,
       overflow: "hidden",
       minWidth: 0,
     }}>
@@ -5783,7 +5792,7 @@ function SelectInput({ defaultValue, options }: { defaultValue: string; options:
     <select
       defaultValue={defaultValue}
       style={{
-        background: "oklch(0.2 0 0)",
+        background: tokens.bg,
         color: tokens.fg,
         border: `1px solid ${tokens.border}`,
         borderRadius: 6,
