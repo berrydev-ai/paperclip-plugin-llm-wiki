@@ -821,6 +821,35 @@ describe("LLM Wiki plugin scaffold", () => {
     expect(markup).not.toContain(">Operations</h2>");
   });
 
+  it("renders ingest controls with Paperclip theme-aware surfaces", () => {
+    mockPathname = "/PAP/wiki/ingest";
+    const markup = renderToStaticMarkup(createElement(WikiPage, {
+      context: { companyId: COMPANY_ID, companyPrefix: "PAP" },
+    } as never));
+
+    const ingestMarkup = markup.slice(markup.indexOf("Capture into"));
+    expect(ingestMarkup).toContain("background:var(--background");
+    expect(ingestMarkup).toContain("background:color-mix(in oklab, var(--background");
+    expect(ingestMarkup).not.toContain("background:oklch(0.2 0 0)");
+    expect(ingestMarkup).toContain("Source title (optional)");
+    expect(ingestMarkup).toContain("Paste markdown / text");
+  });
+
+  it("renders settings controls with Paperclip theme-aware surfaces", () => {
+    mockPathname = "/PAP/wiki/settings";
+    const rootMarkup = renderToStaticMarkup(createElement(WikiPage, {
+      context: { companyId: COMPANY_ID, companyPrefix: "PAP" },
+    } as never));
+    expect(rootMarkup).toContain("background:var(--background");
+    expect(rootMarkup).not.toContain("background:oklch(0.18 0 0)");
+
+    mockPathname = "/PAP/wiki/settings/distillation";
+    const distillationMarkup = renderToStaticMarkup(createElement(WikiPage, {
+      context: { companyId: COMPANY_ID, companyPrefix: "PAP" },
+    } as never));
+    expect(distillationMarkup).not.toContain("background:oklch(0.2 0 0)");
+  });
+
   it("loads AGENTS.md from the Wiki page and exposes an edit affordance", () => {
     mockPathname = "/PAP/wiki/page/templates/AGENTS.md";
     const markup = renderToStaticMarkup(createElement(WikiPage, {
