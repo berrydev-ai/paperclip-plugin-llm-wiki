@@ -33,6 +33,7 @@ import {
   getOverview,
   listSpaces,
   handlePaperclipEventIngestion,
+  handleWikiOperationEvent,
   listWikiAgentOptions,
   listWikiProjectOptions,
   listOperations,
@@ -92,6 +93,14 @@ const PAPERCLIP_EVENT_INGESTION_EVENTS = [
   "issue.comment.created",
   "issue.document.created",
   "issue.document.updated",
+] as const;
+const WIKI_OPERATION_EVENTS = [
+  "issue.updated",
+  "agent.run.started",
+  "agent.run.finished",
+  "agent.run.failed",
+  "agent.run.cancelled",
+  "cost_event.created",
 ] as const;
 
 type ManagedRoutineDefaultDrift = {
@@ -200,6 +209,12 @@ const plugin = definePlugin({
             cursorId: result.cursorId,
           });
         }
+      });
+    }
+
+    for (const eventName of WIKI_OPERATION_EVENTS) {
+      ctx.events.on(eventName, async (event) => {
+        await handleWikiOperationEvent(ctx, event);
       });
     }
 
@@ -688,6 +703,7 @@ const plugin = definePlugin({
         includeSupportingPages: params.includeSupportingPages !== false,
         workItemId: workItem.workItemId,
         operationIssueId: operation.issue.id,
+        operationId: operation.operationId,
       });
       return { ...result, workItem, operation };
     });

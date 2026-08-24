@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, Project, ToolResult } from "@paperclipai/plugin-sdk";
+import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, Project, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
 import type { IssueDocument, PluginIssueOriginKind, PluginManagedRoutineResolution, PluginManagedSkillResolution } from "@paperclipai/plugin-sdk/types";
 import {
   DEFAULT_MAX_SOURCE_BYTES,
@@ -366,6 +366,7 @@ type PaperclipProjectPageDistillationInput = PaperclipSourceBundleInput & {
   autoApply?: boolean;
   expectedProjectPageHash?: string | null;
   includeSupportingPages?: boolean;
+  operationId?: string | null;
 };
 
 type WritePageInput = {
@@ -423,6 +424,21 @@ type PaperclipEventIngestResult =
   | { status: "skipped"; reason: "disabled" | "source_disabled" | "unsupported_event" | "missing_issue" | "missing_comment" | "missing_document" | "plugin_operation" | "already_ingested" }
   | { status: "recorded"; sourceKind: WikiEventIngestionSource; sourceId: string; cursorId: string; issueId: string };
 
+type WikiOperationRecord = {
+  id: string;
+  status: string;
+  hidden_issue_id: string | null;
+  run_ids: unknown;
+  metadata: unknown;
+};
+
+type WikiOperationAffectedPageRow = {
+  path: string;
+  title: string | null;
+  page_type: string | null;
+  revision_id: string;
+};
+
 type WikiResourceBinding = {
   resolvedId: string | null;
   metadata: Record<string, unknown>;
@@ -436,6 +452,22 @@ function requireString(value: unknown, name: string): string {
   const field = stringField(value);
   if (!field) throw new Error(`${name} is required`);
   return field;
+}
+
+function optionalUuidField(value: unknown, name: string): string | null {
+  const field = stringField(value);
+  if (!field) return null;
+  if (!uuidField(field)) {
+    throw new Error(`${name} must be a UUID`);
+  }
+  return field;
+}
+
+function uuidField(value: unknown): string | null {
+  const field = stringField(value);
+  return field && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(field)
+    ? field
+    : null;
 }
 
 function normalizeWikiId(value: unknown): string {
@@ -2299,6 +2331,7 @@ function operationPromptWithSpaceContext(input: OperationSpaceContext): string {
   const paperclipDerived = input.operationType === "distill" || input.operationType === "backfill";
   return [
     `Plugin operation: ${input.operationType}`,
+    `Operation ID: ${input.operationId}`,
     `Wiki ID: ${input.wikiId}`,
     `Space: ${input.space.displayName} (${input.space.slug})`,
     `Space root: ${operationSpaceRoot(input.space)}`,
@@ -2306,6 +2339,7 @@ function operationPromptWithSpaceContext(input: OperationSpaceContext): string {
     "",
     "Space isolation requirement:",
     `- Pass wikiId \`${input.wikiId}\` and spaceSlug \`${input.space.slug}\` on every LLM Wiki tool call.`,
+    `- Pass operationId \`${input.operationId}\` on every wiki_write_page call so written revisions are attributed to this operation.`,
     "- Treat all paths in the prompt as relative to this space root.",
     paperclipDerived
       ? "- Paperclip-derived distill/backfill operations are default-space-only in Phase 1. Stop and comment if asked to write Paperclip-derived pages into a non-default space."
@@ -3501,6 +3535,7 @@ export async function distillPaperclipProjectPage(ctx: PluginContext, input: Pap
       expectedHash: patch.currentHash,
       summary: `Paperclip distillation ${patch.operationType} from ${bundle.sourceHash}`,
       sourceRefs: patch.sourceRefs,
+      operationId: input.operationId,
     });
     await upsertPageBinding(ctx, {
       companyId: input.companyId,
@@ -3787,14 +3822,16 @@ function queryStreamChannel(operationId: string): string {
   return `llm-wiki:query:${operationId}`;
 }
 
-function buildQueryPrompt(input: { companyId: string; wikiId: string; space: WikiSpace; question: string }): string {
+function buildQueryPrompt(input: { companyId: string; wikiId: string; space: WikiSpace; operationId: string; question: string }): string {
   return [
     QUERY_PROMPT,
     `Company ID: ${input.companyId}`,
+    `Operation ID: ${input.operationId}`,
     `Wiki ID: ${input.wikiId}`,
     `Space: ${input.space.displayName} (${input.space.slug})`,
     `Space root: ${operationSpaceRoot(input.space)}`,
     `Tool arguments: always pass wikiId \`${input.wikiId}\` and spaceSlug \`${input.space.slug}\`.`,
+    `When writing a page, also pass operationId \`${input.operationId}\`.`,
     "Use the LLM Wiki plugin tools against that space only. Read wiki/index.md first with wiki_read_page, then use wiki_search, wiki_read_page, wiki_list_sources, and wiki_read_source as needed.",
     "Cite the wiki page paths and raw source paths you used. If the wiki does not contain enough evidence, say that directly.",
     `Question: ${input.question}`,
@@ -3804,31 +3841,232 @@ function buildQueryPrompt(input: { companyId: string; wikiId: string; space: Wik
 async function markOperation(ctx: PluginContext, input: {
   companyId: string;
   operationId: string;
-  status: string;
+  status?: string | null;
   runId?: string | null;
+  runIds?: string[] | null;
   warning?: string | null;
   affectedPages?: unknown[] | null;
+  costCents?: number | null;
   metadata?: Record<string, unknown> | null;
 }) {
+  const runIds = [
+    ...(Array.isArray(input.runIds) ? input.runIds : []),
+    ...(input.runId ? [input.runId] : []),
+  ];
   await ctx.db.execute(
     `UPDATE ${tableName(ctx.db.namespace, "wiki_operations")}
-        SET status = $3,
-            run_ids = CASE WHEN $4::jsonb = '[]'::jsonb THEN run_ids ELSE run_ids || $4::jsonb END,
-            warnings = CASE WHEN $5::jsonb = '[]'::jsonb THEN warnings ELSE warnings || $5::jsonb END,
-            affected_pages = CASE WHEN $6::jsonb = '[]'::jsonb THEN affected_pages ELSE $6::jsonb END,
-            metadata = metadata || $7::jsonb,
+        SET status = CASE
+              WHEN $3::text IS NULL THEN status
+              WHEN status IN ('done', 'failed', 'blocked') AND $3::text IN ('queued', 'running') THEN status
+              ELSE $3::text
+            END,
+            run_ids = (
+              SELECT coalesce(jsonb_agg(item.value ORDER BY item.first_position), '[]'::jsonb)
+                FROM (
+                  SELECT value, min(position) AS first_position
+                    FROM jsonb_array_elements_text(run_ids || $4::jsonb) WITH ORDINALITY AS entry(value, position)
+                   GROUP BY value
+                ) item
+            ),
+            warnings = (
+              SELECT coalesce(jsonb_agg(item.value ORDER BY item.first_position), '[]'::jsonb)
+                FROM (
+                  SELECT value, min(position) AS first_position
+                    FROM jsonb_array_elements_text(warnings || $5::jsonb) WITH ORDINALITY AS entry(value, position)
+                   GROUP BY value
+                ) item
+            ),
+            affected_pages = CASE WHEN $6::jsonb IS NULL THEN affected_pages ELSE $6::jsonb END,
+            cost_cents = greatest(cost_cents, coalesce($7::integer, cost_cents)),
+            metadata = metadata || $8::jsonb,
             updated_at = now()
       WHERE company_id = $1 AND id = $2`,
     [
       input.companyId,
       input.operationId,
-      input.status,
-      jsonArrayParam(input.runId ? [input.runId] : []),
+      input.status ?? null,
+      jsonArrayParam(runIds),
       jsonArrayParam(input.warning ? [input.warning] : []),
-      jsonArrayParam(input.affectedPages ?? []),
+      input.affectedPages == null ? null : jsonArrayParam(input.affectedPages),
+      typeof input.costCents === "number" && Number.isFinite(input.costCents) ? Math.max(0, Math.floor(input.costCents)) : null,
       jsonParam(input.metadata ?? {}),
     ],
   );
+}
+
+function issueOperationStatus(issue: Issue): "queued" | "running" | "done" | "blocked" | "failed" {
+  if (issue.status === "done") return "done";
+  if (issue.status === "blocked") return "blocked";
+  if (issue.status === "cancelled") return "failed";
+  if (issue.status === "in_progress" || issue.status === "in_review") return "running";
+  return "queued";
+}
+
+function operationMetadataRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+async function findOperationForEvent(ctx: PluginContext, input: {
+  companyId: string;
+  issueId?: string | null;
+  runId?: string | null;
+}): Promise<WikiOperationRecord | null> {
+  if (!input.issueId && !input.runId) return null;
+  const rows = await ctx.db.query<WikiOperationRecord>(
+    `SELECT id, status, hidden_issue_id, run_ids, metadata
+       FROM ${tableName(ctx.db.namespace, "wiki_operations")}
+      WHERE company_id = $1
+        AND (($2::uuid IS NOT NULL AND hidden_issue_id = $2::uuid)
+          OR ($3::text IS NOT NULL AND run_ids @> jsonb_build_array($3::text)))
+      ORDER BY CASE WHEN hidden_issue_id = $2::uuid THEN 0 ELSE 1 END, updated_at DESC
+      LIMIT 1`,
+    [input.companyId, input.issueId ?? null, input.runId ?? null],
+  );
+  return rows[0] ?? null;
+}
+
+async function affectedPagesForOperation(ctx: PluginContext, input: {
+  companyId: string;
+  operationId: string;
+}) {
+  const rows = await ctx.db.query<WikiOperationAffectedPageRow>(
+    `SELECT DISTINCT ON (revision.path)
+            revision.path,
+            page.title,
+            page.page_type,
+            revision.id AS revision_id
+       FROM ${tableName(ctx.db.namespace, "wiki_page_revisions")} revision
+       LEFT JOIN ${tableName(ctx.db.namespace, "wiki_pages")} page ON page.id = revision.page_id
+      WHERE revision.company_id = $1 AND revision.operation_id = $2
+      ORDER BY revision.path, revision.created_at DESC, revision.id DESC`,
+    [input.companyId, input.operationId],
+  );
+  return rows.map((row) => ({
+    path: row.path,
+    title: row.title ?? row.path,
+    pageType: row.page_type,
+    revisionId: row.revision_id,
+  }));
+}
+
+async function reconcileOperationIssue(ctx: PluginContext, issue: Issue, event: PluginEvent) {
+  const operation = await findOperationForEvent(ctx, { companyId: issue.companyId, issueId: issue.id });
+  if (!operation) return;
+
+  const metadata = operationMetadataRecord(operation.metadata);
+  const billingCode = stringField(issue.billingCode) ?? stringField(metadata.billingCode);
+  let runIds: string[] = [];
+  let costCents: number | null = null;
+  try {
+    const summary = await ctx.issues.summaries.getOrchestration({
+      issueId: issue.id,
+      companyId: issue.companyId,
+      includeSubtree: false,
+      billingCode,
+    });
+    runIds = summary.runs.map((run) => run.id);
+    costCents = summary.costs.costCents;
+  } catch (error) {
+    ctx.logger.warn("LLM Wiki could not read operation orchestration summary", {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      operationId: operation.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  const affectedPages = await affectedPagesForOperation(ctx, {
+    companyId: issue.companyId,
+    operationId: operation.id,
+  });
+  await markOperation(ctx, {
+    companyId: issue.companyId,
+    operationId: operation.id,
+    status: issueOperationStatus(issue),
+    runIds,
+    affectedPages,
+    costCents,
+    metadata: {
+      reconciledFromEventId: event.eventId,
+      reconciledFromIssueStatus: issue.status,
+      reconciledAt: event.occurredAt,
+    },
+  });
+}
+
+async function recordOperationCostEvent(ctx: PluginContext, input: {
+  companyId: string;
+  operationId: string;
+  event: PluginEvent;
+  costCents: number;
+}) {
+  await ctx.db.execute(
+    `WITH claimed AS (
+     INSERT INTO ${tableName(ctx.db.namespace, "wiki_operation_events")}
+         (event_id, company_id, operation_id, event_type, cost_cents, metadata)
+       VALUES ($3, $1, $2, 'cost_event.created', $4, $5::jsonb)
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING operation_id, cost_cents
+     )
+     UPDATE ${tableName(ctx.db.namespace, "wiki_operations")} operation
+        SET event_cost_cents = operation.event_cost_cents + claimed.cost_cents,
+            cost_cents = GREATEST(operation.cost_cents, operation.event_cost_cents + claimed.cost_cents),
+            updated_at = now()
+       FROM claimed
+      WHERE operation.company_id = $1
+        AND operation.id = $2
+        AND claimed.operation_id = operation.id`,
+    [input.companyId, input.operationId, input.event.eventId, input.costCents, jsonParam(eventPayload(input.event))],
+  );
+}
+
+export async function handleWikiOperationEvent(ctx: PluginContext, event: PluginEvent): Promise<void> {
+  const payload = eventPayload(event);
+  if (event.eventType === "issue.updated") {
+    const issueId = uuidField(event.entityId);
+    if (!issueId) return;
+    const issue = await ctx.issues.get(issueId, event.companyId);
+    if (issue && isLlmWikiOperationIssue(issue)) await reconcileOperationIssue(ctx, issue, event);
+    return;
+  }
+
+  const runId = uuidField(payload.runId ?? payload.heartbeatRunId ?? event.entityId);
+  const issueId = uuidField(payload.issueId);
+  const operation = await findOperationForEvent(ctx, { companyId: event.companyId, issueId, runId });
+  if (!operation) return;
+
+  if (event.eventType === "cost_event.created") {
+    const rawCostCents = payload.costCents;
+    if (typeof rawCostCents !== "number" || !Number.isFinite(rawCostCents) || rawCostCents < 0) return;
+    await recordOperationCostEvent(ctx, {
+      companyId: event.companyId,
+      operationId: operation.id,
+      event,
+      costCents: Math.floor(rawCostCents),
+    });
+    return;
+  }
+
+  const status = event.eventType === "agent.run.started"
+    ? "running"
+    : event.eventType === "agent.run.finished"
+      ? "done"
+      : event.eventType === "agent.run.failed" || event.eventType === "agent.run.cancelled"
+        ? "failed"
+        : null;
+  if (!status) return;
+  await markOperation(ctx, {
+    companyId: event.companyId,
+    operationId: operation.id,
+    status,
+    runId,
+    warning: status === "failed" ? stringField(payload.error) ?? stringField(payload.errorCode) : null,
+    metadata: { lastRunEventId: event.eventId, lastRunEventType: event.eventType },
+  });
+
+  if (operation.hidden_issue_id && event.eventType !== "agent.run.started") {
+    const issue = await ctx.issues.get(operation.hidden_issue_id, event.companyId);
+    if (issue && isLlmWikiOperationIssue(issue)) await reconcileOperationIssue(ctx, issue, event);
+  }
 }
 
 function isTerminalSessionEvent(event: AgentSessionEvent): boolean {
@@ -3890,7 +4128,7 @@ export async function startWikiQuerySession(ctx: PluginContext, input: QuerySess
     [operation.operationId, input.companyId, wikiId, operation.issue.id, session.sessionId, space.id],
   );
 
-  const prompt = buildQueryPrompt({ companyId: input.companyId, wikiId, space, question });
+  const prompt = buildQueryPrompt({ companyId: input.companyId, wikiId, space, operationId: operation.operationId, question });
   ctx.streams.open(channel, input.companyId);
   ctx.streams.emit(channel, {
     type: "query.started",
@@ -4106,10 +4344,12 @@ export async function registerWikiTools(ctx: PluginContext) {
     displayName: "Write Wiki Page",
     description: "Atomically write a markdown wiki page after plugin path validation.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_write_page")?.parametersSchema ?? { type: "object" },
-  }, async (params: unknown): Promise<ToolResult> => {
+  }, async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
     const input = params as ToolParams;
+    const companyId = requireString(input.companyId, "companyId");
+    const operationId = optionalUuidField(input.operationId, "operationId");
     const result = await writeWikiPage(ctx, {
-      companyId: requireString(input.companyId, "companyId"),
+      companyId,
       wikiId: stringField(input.wikiId),
       spaceSlug: stringField(input.spaceSlug),
       path: requireString(input.path, "path"),
@@ -4117,7 +4357,15 @@ export async function registerWikiTools(ctx: PluginContext) {
       expectedHash: stringField(input.expectedHash),
       summary: stringField(input.summary),
       sourceRefs: input.sourceRefs,
+      operationId,
     });
+    if (operationId) {
+      await markOperation(ctx, {
+        companyId,
+        operationId,
+        runId: runCtx.runId,
+      });
+    }
     return { content: `Wrote ${result.path}`, data: result };
   });
 
