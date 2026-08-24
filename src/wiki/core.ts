@@ -3767,12 +3767,14 @@ async function routePaperclipCursorObservation(ctx: PluginContext, input: {
   return recorded[0] ?? { status: "skipped", reason: "source_disabled" };
 }
 
-export async function handlePaperclipEventIngestion(ctx: PluginContext, event: PluginEvent): Promise<PaperclipEventIngestResult> {
+export async function handlePaperclipEventIngestion(ctx: PluginContext, event: PluginEvent, prefetchedIssue?: Issue | null): Promise<PaperclipEventIngestResult> {
   const companyId = event.companyId;
 
   const issueId = stringField(event.entityId);
   if (!issueId) return { status: "skipped", reason: "unsupported_event" };
-  const issue = await ctx.issues.get(issueId, companyId);
+  // Reuse an already-fetched issue when the caller provides one; `undefined`
+  // means "not provided" so we still fetch on the direct path.
+  const issue = prefetchedIssue !== undefined ? prefetchedIssue : await ctx.issues.get(issueId, companyId);
   if (!issue) return { status: "skipped", reason: "missing_issue" };
   if (isLlmWikiOperationIssue(issue)) return { status: "skipped", reason: "plugin_operation" };
 
@@ -3857,7 +3859,12 @@ async function markOperation(ctx: PluginContext, input: {
     `UPDATE ${tableName(ctx.db.namespace, "wiki_operations")}
         SET status = CASE
               WHEN $3::text IS NULL THEN status
-              WHEN status IN ('done', 'failed', 'blocked') AND $3::text IN ('queued', 'running') THEN status
+              -- 'done' is the only sticky status: once an operation has
+              -- completed, a later out-of-order lifecycle event must not drag
+              -- it back to an active status. 'blocked' and 'failed' stay
+              -- overridable so that unblocking or retrying an operation is
+              -- reflected as it resumes running.
+              WHEN status = 'done' AND $3::text IN ('queued', 'running') THEN status
               ELSE $3::text
             END,
             run_ids = (
@@ -3876,7 +3883,7 @@ async function markOperation(ctx: PluginContext, input: {
                    GROUP BY value
                 ) item
             ),
-            affected_pages = CASE WHEN $6::jsonb IS NULL THEN affected_pages ELSE $6::jsonb END,
+            affected_pages = CASE WHEN $6::jsonb IS NULL OR $6::jsonb = '[]'::jsonb THEN affected_pages ELSE $6::jsonb END,
             cost_cents = greatest(cost_cents, coalesce($7::integer, cost_cents)),
             metadata = metadata || $8::jsonb,
             updated_at = now()
@@ -4019,12 +4026,14 @@ async function recordOperationCostEvent(ctx: PluginContext, input: {
   );
 }
 
-export async function handleWikiOperationEvent(ctx: PluginContext, event: PluginEvent): Promise<void> {
+export async function handleWikiOperationEvent(ctx: PluginContext, event: PluginEvent, prefetchedIssue?: Issue | null): Promise<void> {
   const payload = eventPayload(event);
   if (event.eventType === "issue.updated") {
     const issueId = uuidField(event.entityId);
     if (!issueId) return;
-    const issue = await ctx.issues.get(issueId, event.companyId);
+    // When the caller already fetched the issue (see reconcileOrIngestIssueUpdate)
+    // reuse it; `undefined` means "not provided" so we still fetch on the direct path.
+    const issue = prefetchedIssue !== undefined ? prefetchedIssue : await ctx.issues.get(issueId, event.companyId);
     if (issue && isLlmWikiOperationIssue(issue)) await reconcileOperationIssue(ctx, issue, event);
     return;
   }
@@ -4067,6 +4076,20 @@ export async function handleWikiOperationEvent(ctx: PluginContext, event: Plugin
     const issue = await ctx.issues.get(operation.hidden_issue_id, event.companyId);
     if (issue && isLlmWikiOperationIssue(issue)) await reconcileOperationIssue(ctx, issue, event);
   }
+}
+
+// `issue.updated` feeds both wiki-operation reconciliation and Paperclip source
+// ingestion, and the two paths are mutually exclusive by issue origin. Fetch the
+// issue a single time here and dispatch, so a company-wide issue update costs one
+// ctx.issues.get instead of one per handler.
+export async function reconcileOrIngestIssueUpdate(ctx: PluginContext, event: PluginEvent): Promise<PaperclipEventIngestResult | null> {
+  const issueId = stringField(event.entityId);
+  const issue = issueId ? await ctx.issues.get(issueId, event.companyId) : null;
+  if (issue && isLlmWikiOperationIssue(issue)) {
+    await handleWikiOperationEvent(ctx, event, issue);
+    return null;
+  }
+  return handlePaperclipEventIngestion(ctx, event, issue);
 }
 
 function isTerminalSessionEvent(event: AgentSessionEvent): boolean {

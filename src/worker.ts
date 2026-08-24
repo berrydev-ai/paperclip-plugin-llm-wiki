@@ -34,6 +34,7 @@ import {
   listSpaces,
   handlePaperclipEventIngestion,
   handleWikiOperationEvent,
+  reconcileOrIngestIssueUpdate,
   listWikiAgentOptions,
   listWikiProjectOptions,
   listOperations,
@@ -87,15 +88,16 @@ function routineOverridesFromParams(params: Record<string, unknown>) {
 }
 
 let activeContext: PluginContext | null = null;
+// `issue.updated` is intentionally absent from both lists below: it feeds both
+// ingestion and operation reconciliation, so it is handled once by a dedicated
+// dispatcher (see setup) that fetches the issue a single time.
 const PAPERCLIP_EVENT_INGESTION_EVENTS = [
   "issue.created",
-  "issue.updated",
   "issue.comment.created",
   "issue.document.created",
   "issue.document.updated",
 ] as const;
 const WIKI_OPERATION_EVENTS = [
-  "issue.updated",
   "agent.run.started",
   "agent.run.finished",
   "agent.run.failed",
@@ -217,6 +219,19 @@ const plugin = definePlugin({
         await handleWikiOperationEvent(ctx, event);
       });
     }
+
+    ctx.events.on("issue.updated", async (event) => {
+      const result = await reconcileOrIngestIssueUpdate(ctx, event);
+      if (result?.status === "recorded") {
+        ctx.logger.info("LLM Wiki recorded Paperclip event for cursor discovery", {
+          eventType: event.eventType,
+          companyId: event.companyId,
+          sourceKind: result.sourceKind,
+          sourceId: result.sourceId,
+          cursorId: result.cursorId,
+        });
+      }
+    });
 
     ctx.data.register("overview", async (params) => {
       const companyId = readCompanyIdFromParams(params);
