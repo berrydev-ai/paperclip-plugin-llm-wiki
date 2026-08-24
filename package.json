@@ -1,6 +1,6 @@
 {
   "name": "@berrydev-ai/plugin-llm-wiki",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Local-file LLM Wiki plugin for source ingestion, wiki browsing, query, lint, and maintenance workflows. Maintained fork of @paperclipai/plugin-llm-wiki.",
   "license": "MIT",
