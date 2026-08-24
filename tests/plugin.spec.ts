@@ -717,12 +717,17 @@ describe("LLM Wiki plugin scaffold", () => {
       "wiki_list_backlinks",
       "wiki_list_pages",
     ]);
+    const writeToolSchema = manifest.tools?.find((tool) => tool.name === "wiki_write_page")?.parametersSchema as {
+      properties?: Record<string, unknown>;
+    };
+    expect(writeToolSchema.properties).toHaveProperty("operationId");
     expect(manifest.ui?.slots?.map((slot) => slot.type)).toEqual([
       "sidebar",
       "page",
       "routeSidebar",
     ]);
     expect(manifest.capabilities).not.toContain("instance.settings.register");
+    expect(manifest.capabilities).toContain("costs.read");
     expect(manifest.instanceConfigSchema).toBeUndefined();
     const routeSidebarSlot = manifest.ui?.slots?.find((slot) => slot.type === "routeSidebar");
     expect(routeSidebarSlot).toMatchObject({
@@ -1831,6 +1836,209 @@ Duplicate headings receive stable suffixes.
     ]));
   });
 
+  it("reconciles a completed plugin-operation issue without ingesting it as wiki source material", async () => {
+    const harness = createTestHarness({ manifest });
+    const operationId = "88888888-8888-4888-8888-888888888888";
+    const runId = "99999999-9999-4999-8999-999999999998";
+    const operationIssue = paperclipIssue({
+      id: "77777777-7777-4777-8777-777777777780",
+      status: "done",
+      originKind: `${OPERATION_ORIGIN_KIND}:ingest`,
+      billingCode: "plugin-llm-wiki:default",
+    });
+    harness.seed({ issues: [operationIssue] });
+    harness.ctx.issues.summaries.getOrchestration = async () => ({
+      issueId: operationIssue.id,
+      companyId: COMPANY_ID,
+      subtreeIssueIds: [operationIssue.id],
+      relations: {},
+      approvals: [],
+      runs: [{
+        id: runId,
+        issueId: operationIssue.id,
+        agentId: wikiMaintainerAgent().id,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: "2026-08-22T12:00:00.000Z",
+        finishedAt: "2026-08-22T12:01:00.000Z",
+        error: null,
+        createdAt: "2026-08-22T12:00:00.000Z",
+      }],
+      costs: {
+        costCents: 143,
+        inputTokens: 1200,
+        cachedInputTokens: 100,
+        outputTokens: 400,
+        billingCode: operationIssue.billingCode,
+      },
+      openBudgetIncidents: [],
+      invocationBlocks: [],
+    });
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_operations")) {
+        return [{
+          id: operationId,
+          status: "queued",
+          hidden_issue_id: operationIssue.id,
+          run_ids: [],
+          metadata: { billingCode: operationIssue.billingCode },
+        }] as T[];
+      }
+      if (sql.includes("wiki_page_revisions")) {
+        return [{
+          path: "wiki/entities/paperclip.md",
+          title: "Paperclip",
+          page_type: "entities",
+          revision_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        }] as T[];
+      }
+      return [] as T[];
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.emit("issue.updated", {}, {
+      companyId: COMPANY_ID,
+      entityId: operationIssue.id,
+      entityType: "issue",
+      eventId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+
+    const update = harness.dbExecutes.find((execute) =>
+      execute.sql.includes("UPDATE") && execute.sql.includes("wiki_operations") && execute.params?.[1] === operationId);
+    expect(update).toBeDefined();
+    expect(update?.params?.[2]).toBe("done");
+    expect(JSON.parse(String(update?.params?.[3]))).toEqual([runId]);
+    expect(JSON.parse(String(update?.params?.[5]))).toEqual([
+      {
+        path: "wiki/entities/paperclip.md",
+        title: "Paperclip",
+        pageType: "entities",
+        revisionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      },
+    ]);
+    expect(update?.params?.[6]).toBe(143);
+    expect(update?.sql).toContain("GROUP BY value");
+    expect(update?.sql).toContain("greatest(cost_cents");
+    expect(harness.dbExecutes.some((execute) => execute.sql.includes("paperclip_distillation_cursors"))).toBe(false);
+  });
+
+  it("maps every Paperclip issue status to a stable operation status", async () => {
+    const harness = createTestHarness({ manifest });
+    const operationId = "88888888-8888-4888-8888-888888888888";
+    const operationIssue = paperclipIssue({
+      id: "77777777-7777-4777-8777-777777777780",
+      status: "todo",
+      originKind: `${OPERATION_ORIGIN_KIND}:backfill`,
+      billingCode: "plugin-llm-wiki:default",
+    });
+    harness.seed({ issues: [operationIssue] });
+    harness.ctx.issues.summaries.getOrchestration = async () => ({
+      issueId: operationIssue.id,
+      companyId: COMPANY_ID,
+      subtreeIssueIds: [operationIssue.id],
+      relations: {},
+      approvals: [],
+      runs: [],
+      costs: { costCents: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, billingCode: operationIssue.billingCode },
+      openBudgetIncidents: [],
+      invocationBlocks: [],
+    });
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_operations")) {
+        return [{
+          id: operationId,
+          status: "queued",
+          hidden_issue_id: operationIssue.id,
+          run_ids: [],
+          metadata: { billingCode: operationIssue.billingCode },
+        }] as T[];
+      }
+      return [] as T[];
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    const mappings = [
+      ["backlog", "queued"],
+      ["todo", "queued"],
+      ["in_progress", "running"],
+      ["in_review", "running"],
+      ["done", "done"],
+      ["blocked", "blocked"],
+      ["cancelled", "failed"],
+    ] as const;
+    for (const [issueStatus, operationStatus] of mappings) {
+      await harness.ctx.issues.update(operationIssue.id, { status: issueStatus }, COMPANY_ID);
+      const executeCount = harness.dbExecutes.length;
+      await harness.emit("issue.updated", {}, {
+        companyId: COMPANY_ID,
+        entityId: operationIssue.id,
+        entityType: "issue",
+      });
+      const update = harness.dbExecutes.slice(executeCount).find((execute) =>
+        execute.sql.includes("UPDATE") && execute.sql.includes("wiki_operations"));
+      expect(update?.params?.[2], issueStatus).toBe(operationStatus);
+    }
+  });
+
+  it("reconciles run events and claims cost events idempotently", async () => {
+    const harness = createTestHarness({ manifest });
+    const operationId = "88888888-8888-4888-8888-888888888888";
+    const runId = "99999999-9999-4999-8999-999999999998";
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_operations")) {
+        return [{
+          id: operationId,
+          status: "running",
+          hidden_issue_id: "77777777-7777-4777-8777-777777777780",
+          run_ids: [runId],
+          metadata: { billingCode: "plugin-llm-wiki:default" },
+        }] as T[];
+      }
+      return [] as T[];
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    await harness.emit("agent.run.started", {
+      runId,
+      issueId: "77777777-7777-4777-8777-777777777780",
+    }, {
+      companyId: COMPANY_ID,
+      entityId: runId,
+      entityType: "agent_run",
+      eventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    });
+    const runUpdate = harness.dbExecutes.find((execute) =>
+      execute.sql.includes("UPDATE") && execute.sql.includes("wiki_operations"));
+    expect(runUpdate?.params?.[2]).toBe("running");
+    expect(JSON.parse(String(runUpdate?.params?.[3]))).toEqual([runId]);
+
+    await harness.emit("cost_event.created", {
+      heartbeatRunId: runId,
+      costCents: 87,
+      billingCode: "plugin-llm-wiki:default",
+    }, {
+      companyId: COMPANY_ID,
+      entityId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      entityType: "cost",
+      eventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    });
+
+    const costUpdate = harness.dbExecutes.find((execute) => execute.sql.includes("wiki_operation_events"));
+    expect(costUpdate).toBeDefined();
+    expect(costUpdate?.sql).toContain("ON CONFLICT");
+    expect(costUpdate?.sql).toContain("GREATEST");
+    expect(costUpdate?.params).toEqual(expect.arrayContaining([
+      COMPANY_ID,
+      operationId,
+      "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      87,
+    ]));
+  });
+
   it("routes Paperclip issue, comment, and document event cursors only to the default space", async () => {
     const harness = createTestHarness({ manifest });
     const issue = paperclipIssue({ projectId: "77777777-7777-4777-8777-777777777777" });
@@ -2450,17 +2658,17 @@ Duplicate headings receive stable suffixes.
       status: string;
       patches: Array<{ operationType: string; proposedContents: string }>;
       workItem: { kind: string };
-      operation: { issue: { originKind: string } };
+      operation: { operationId: string; issue: { originKind: string } };
     }>("backfill-paperclip-distillation", {
       companyId: COMPANY_ID,
       projectId: project.id,
       backfillStartAt: "2026-04-01T00:00:00Z",
       backfillEndAt: "2026-04-30T23:59:59Z",
-      autoApply: false,
+      autoApply: true,
       includeSupportingPages: false,
     });
 
-    expect(result.status).toBe("review_required");
+    expect(result.status).toBe("applied");
     expect(result.workItem.kind).toBe("backfill");
     expect(result.operation.issue.originKind).toBe(`${OPERATION_ORIGIN_KIND}:backfill`);
     const projectPatch = result.patches.find((patch) => patch.operationType === "project_page_distill");
@@ -2470,6 +2678,9 @@ Duplicate headings receive stable suffixes.
     const workItemInsert = harness.dbExecutes.find((execute) =>
       execute.sql.includes("paperclip_distillation_work_items") && execute.params?.[3] === "backfill");
     expect(String(workItemInsert?.params?.[9])).toContain('"backfillStartAt":"2026-04-01T00:00:00Z"');
+    const revisionInserts = harness.dbExecutes.filter((execute) => execute.sql.includes("wiki_page_revisions"));
+    expect(revisionInserts).not.toHaveLength(0);
+    expect(revisionInserts.every((execute) => execute.params?.[6] === result.operation.operationId)).toBe(true);
   });
 
   it("generates review-required Paperclip project page patches with provenance, index, and log updates", async () => {
@@ -3509,17 +3720,24 @@ Duplicate headings receive stable suffixes.
     });
     await expect(staleWrite).rejects.toThrow("Refusing to overwrite");
 
+    const operationId = "88888888-8888-4888-8888-888888888888";
     const result = await harness.executeTool<{ data?: { hash: string } }>("wiki_write_page", {
       companyId: COMPANY_ID,
       wikiId: "default",
+      operationId,
       path: "wiki/concepts/plugin-boundaries.md",
       contents: "# Plugin Boundaries\n\nSee [Knowledge](wiki/areas/knowledge.md).",
+    }, {
+      companyId: COMPANY_ID,
+      runId: "99999999-9999-4999-8999-999999999998",
     });
 
     expect(result.data?.hash).toHaveLength(64);
     expect(files.get("wiki/concepts/plugin-boundaries.md")).toContain("Plugin Boundaries");
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_pages"))).toBe(true);
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_page_revisions"))).toBe(true);
+    const revisionInsert = harness.dbExecutes.find((execute) => execute.sql.includes("wiki_page_revisions"));
+    expect(revisionInsert?.params?.[6]).toBe(operationId);
   });
 
   it("blocks agent-tool writes to AGENTS.md but allows explicit board edits", async () => {
@@ -3632,8 +3850,10 @@ Duplicate headings receive stable suffixes.
 
     expect(result.issue.title).toBe("Run LLM Wiki lint [space: Research Space / research-space]");
     expect(result.issue.description).toContain("Space: Research Space (research-space)");
+    expect(result.issue.description).toContain(`Operation ID: ${result.operationId}`);
     expect(result.issue.description).toContain("Space root: wiki-root/spaces/research-space");
     expect(result.issue.description).toContain("Pass wikiId `default` and spaceSlug `research-space`");
+    expect(result.issue.description).toContain(`Pass operationId \`${result.operationId}\` on every wiki_write_page call`);
     expect(result.issue.description).toContain("Manual ingest, query, lint, index, and file-as-page operations follow the named destination space");
     expect(result.issue.billingCode).toBe("plugin-llm-wiki:default:research-space");
     expect(result.issue.originId).toBe(`wiki:default:space:research-space:operation:${result.operationId}`);

@@ -47,6 +47,7 @@ The alpha surface includes:
 - plugin database namespace migration for wiki instances, sources, pages, operations, query sessions, and resource bindings
 - managed `Wiki Maintainer` agent, managed `LLM Wiki` project, and paused managed routines for wiki update processing, lint, and index refresh
 - plugin-operation issue creation using `surfaceVisibility: "plugin_operation"`
+- operation reconciliation from Paperclip issue/run lifecycle events, including run IDs, terminal status, affected pages, and issue-scoped cost summaries
 - local source capture into `raw/` with metadata rows in the plugin DB namespace
 - opt-in company-scoped Paperclip event ingestion controls for issues, comments, and documents; event ingestion is disabled by default and routes captured raw provenance into the default space only
 - manual Paperclip project/root issue distillation and bounded backfill actions with explicit work items, operation issues, source caps, and estimated cost recording
@@ -103,10 +104,12 @@ The focused Vitest suite covers:
 - managed routine declarations, manual distill/backfill work items, source cap handling, and backfill project/date scoping
 - atomic page writes, metadata/revision rows, backlinks, and stale-hash refusal
 - query session creation, run-id recording, stream event forwarding, and completion updates
+- idempotent operation lifecycle and cost-event reconciliation
 - filing a streamed query answer back into the wiki through a hidden operation
 
 Remaining alpha gaps:
 
+- Paperclip currently declares `cost_event.created` for plugins but does not publish it when cost rows are created. Issue-scoped operation costs still reconcile through orchestration summaries; standalone query-session spend needs the host to publish the declared event before it can be attributed live.
 - Browser screenshot capture is maintained separately under `tests/screenshots`;
   generated `screenshots/` outputs are local artifacts and are ignored by git.
 - Host-level plugin install and live agent invocation still need Paperclip

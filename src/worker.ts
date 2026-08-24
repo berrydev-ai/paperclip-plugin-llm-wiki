@@ -33,6 +33,8 @@ import {
   getOverview,
   listSpaces,
   handlePaperclipEventIngestion,
+  handleWikiOperationEvent,
+  reconcileOrIngestIssueUpdate,
   listWikiAgentOptions,
   listWikiProjectOptions,
   listOperations,
@@ -86,12 +88,21 @@ function routineOverridesFromParams(params: Record<string, unknown>) {
 }
 
 let activeContext: PluginContext | null = null;
+// `issue.updated` is intentionally absent from both lists below: it feeds both
+// ingestion and operation reconciliation, so it is handled once by a dedicated
+// dispatcher (see setup) that fetches the issue a single time.
 const PAPERCLIP_EVENT_INGESTION_EVENTS = [
   "issue.created",
-  "issue.updated",
   "issue.comment.created",
   "issue.document.created",
   "issue.document.updated",
+] as const;
+const WIKI_OPERATION_EVENTS = [
+  "agent.run.started",
+  "agent.run.finished",
+  "agent.run.failed",
+  "agent.run.cancelled",
+  "cost_event.created",
 ] as const;
 
 type ManagedRoutineDefaultDrift = {
@@ -202,6 +213,25 @@ const plugin = definePlugin({
         }
       });
     }
+
+    for (const eventName of WIKI_OPERATION_EVENTS) {
+      ctx.events.on(eventName, async (event) => {
+        await handleWikiOperationEvent(ctx, event);
+      });
+    }
+
+    ctx.events.on("issue.updated", async (event) => {
+      const result = await reconcileOrIngestIssueUpdate(ctx, event);
+      if (result?.status === "recorded") {
+        ctx.logger.info("LLM Wiki recorded Paperclip event for cursor discovery", {
+          eventType: event.eventType,
+          companyId: event.companyId,
+          sourceKind: result.sourceKind,
+          sourceId: result.sourceId,
+          cursorId: result.cursorId,
+        });
+      }
+    });
 
     ctx.data.register("overview", async (params) => {
       const companyId = readCompanyIdFromParams(params);
@@ -688,6 +718,7 @@ const plugin = definePlugin({
         includeSupportingPages: params.includeSupportingPages !== false,
         workItemId: workItem.workItemId,
         operationIssueId: operation.issue.id,
+        operationId: operation.operationId,
       });
       return { ...result, workItem, operation };
     });
